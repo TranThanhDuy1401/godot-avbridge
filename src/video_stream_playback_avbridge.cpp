@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 using namespace godot;
 
@@ -69,6 +70,9 @@ bool VideoStreamPlaybackAVBridge::_open_decoder() {
     opts.enable_audio        = 1;
     opts.audio_stream_index  = _audio_track;
     opts.video_format        = AVB_PIXEL_FORMAT_RGBA8;
+    opts.video_memory        = AVB_VIDEO_MEMORY_CPU;
+    opts.video_external_type = AVB_VIDEO_EXTERNAL_NONE;
+    opts.hardware_policy     = AVB_HARDWARE_DISABLED;
 
     // Prefer opening the real file directly: the backend streams from disk with
     // no temporary copy. globalize_path resolves res:// / user:// to an OS path.
@@ -100,7 +104,14 @@ bool VideoStreamPlaybackAVBridge::_open_decoder() {
         return false;
     }
 
-    avb_decoder_get_media_info(_decoder, &_info);
+    res = avb_decoder_get_media_info(_decoder, &_info);
+    if (res != AVB_OK) {
+        const char *err = avb_decoder_get_last_error(_decoder);
+        UtilityFunctions::printerr("[avbridge] media info failed (", avb_result_string(res),
+                                   "): ", err ? err : "unknown");
+        _close_decoder();
+        return false;
+    }
     if (!_info.video.available) {
         UtilityFunctions::printerr("[avbridge] no video stream in: ", _file_path);
         _close_decoder();
@@ -190,16 +201,30 @@ void VideoStreamPlaybackAVBridge::_mix_audio(double p_time) {
 Ref<Image> VideoStreamPlaybackAVBridge::_frame_to_image(const avb_video_frame &p_frame) const {
     const int w = p_frame.width;
     const int h = p_frame.height;
-    if (w <= 0 || h <= 0 || !p_frame.plane_data[0]) {
+    if (p_frame.memory_type != AVB_VIDEO_MEMORY_CPU ||
+        p_frame.external_type != AVB_VIDEO_EXTERNAL_NONE ||
+        p_frame.format != AVB_PIXEL_FORMAT_RGBA8 ||
+        p_frame.plane_count < 1 ||
+        w <= 0 || h <= 0 ||
+        !p_frame.plane_data[0]) {
+        return {};
+    }
+
+    const int64_t row = (int64_t)w * 4;
+    const int64_t stride = p_frame.plane_stride[0];
+    const int64_t offset = p_frame.plane_offset[0];
+    if (row > std::numeric_limits<int>::max() ||
+        stride < row ||
+        offset < 0 ||
+        p_frame.data_size <= 0 ||
+        offset + stride * (h - 1) + row > p_frame.data_size) {
         return {};
     }
 
     PackedByteArray buf;
-    buf.resize(w * h * 4);
+    buf.resize((int)(row * h));
     uint8_t       *dst    = buf.ptrw();
     const uint8_t *src    = p_frame.plane_data[0];
-    const int      stride = p_frame.plane_stride[0];
-    const int      row    = w * 4;
 
     if (stride == row) {
         memcpy(dst, src, (size_t)row * h);
@@ -233,12 +258,22 @@ void VideoStreamPlaybackAVBridge::_decode_next_frame() {
     avb_video_frame frame{};
     avb_result      res = avb_decoder_read_video_frame(_decoder, &frame);
     if (res != AVB_OK) {
-        return; // AVB_ERROR_EOF or a decode error: leave _have_next false.
+        if (res != AVB_ERROR_EOF) {
+            const char *err = avb_decoder_get_last_error(_decoder);
+            UtilityFunctions::printerr("[avbridge] video decode failed (",
+                                       avb_result_string(res), "): ",
+                                       err ? err : "unknown");
+        }
+        return;
     }
 
     _next_image = _frame_to_image(frame);
     _next_pts   = frame.pts_sec;
     _have_next  = _next_image.is_valid();
+    if (!_have_next) {
+        UtilityFunctions::printerr(
+            "[avbridge] decoded frame is not CPU-backed RGBA8 or has an invalid plane layout");
+    }
 
     avb_decoder_release_video_frame(_decoder, &frame);
 }

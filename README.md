@@ -21,8 +21,8 @@ $VideoStreamPlayer.stream = stream
 $VideoStreamPlayer.play()
 ```
 
-`VideoStreamAVBridge` decodes video to `RGBA8` and feeds audio to the
-`VideoStreamPlayer` automatically.
+`VideoStreamAVBridge` requests CPU-backed `RGBA8` frames from libavbridge and
+feeds decoded audio to the `VideoStreamPlayer` automatically.
 
 ## Build
 
