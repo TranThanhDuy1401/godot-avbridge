@@ -1,11 +1,12 @@
 #include "video_stream_playback_avbridge.hpp"
+#include "nv12_gpu_converter.hpp"
 
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/core/math.hpp>
+#include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
-#include <cstdio>
-#include <cstring>
-#include <limits>
+#include <stdio.h>
 
 using namespace godot;
 
@@ -42,10 +43,14 @@ long long avb_fa_size(void *user) {
 
 VideoStreamPlaybackAVBridge::VideoStreamPlaybackAVBridge() {
     _texture.instantiate();
+    _nv12_converter = memnew(NV12GPUConverter);
+    _use_nv12_gpu = _nv12_converter->is_available();
 }
 
 VideoStreamPlaybackAVBridge::~VideoStreamPlaybackAVBridge() {
     _close_decoder();
+    memdelete(_nv12_converter);
+    _nv12_converter = nullptr;
 }
 
 void VideoStreamPlaybackAVBridge::_bind_methods() {}
@@ -65,14 +70,17 @@ bool VideoStreamPlaybackAVBridge::_open_decoder() {
         return false;
     }
 
+    _use_nv12_gpu = _nv12_converter && _nv12_converter->is_available();
+
     avb_decode_options opts = avb_decode_options_default();
     opts.enable_video        = 1;
     opts.enable_audio        = 1;
     opts.audio_stream_index  = _audio_track;
-    opts.video_format        = AVB_PIXEL_FORMAT_RGBA8;
+    opts.video_format        = _use_nv12_gpu ? AVB_PIXEL_FORMAT_NV12
+                                             : AVB_PIXEL_FORMAT_RGBA8;
     opts.video_memory        = AVB_VIDEO_MEMORY_CPU;
     opts.video_external_type = AVB_VIDEO_EXTERNAL_NONE;
-    opts.hardware_policy     = AVB_HARDWARE_DISABLED;
+    opts.hardware_policy     = AVB_HARDWARE_PREFER;
 
     // Prefer opening the real file directly: the backend streams from disk with
     // no temporary copy. globalize_path resolves res:// / user:// to an OS path.
@@ -125,6 +133,9 @@ bool VideoStreamPlaybackAVBridge::_open_decoder() {
 
     _decoder_open = true;
     _decode_next_frame();
+    if (_have_next) {
+        _present_next_frame();
+    }
     return true;
 }
 
@@ -138,7 +149,18 @@ void VideoStreamPlaybackAVBridge::_close_decoder() {
     _info                = avb_media_info{};
     _have_next           = false;
     _next_image          = Ref<Image>();
+    _next_y.clear();
+    _next_uv.clear();
+    _next_width          = 0;
+    _next_height         = 0;
+    _next_is_nv12        = false;
+    _next_color_range    = AVB_COLOR_RANGE_UNKNOWN;
+    _next_color_matrix   = AVB_COLOR_MATRIX_UNKNOWN;
     _texture_initialized = false;
+    if (_nv12_converter) {
+        _nv12_converter->reset();
+    }
+    _use_nv12_gpu = false;
     _channels            = 0;
     _mix_rate            = 0;
     _reset_audio();
@@ -213,8 +235,7 @@ Ref<Image> VideoStreamPlaybackAVBridge::_frame_to_image(const avb_video_frame &p
     const int64_t row = (int64_t)w * 4;
     const int64_t stride = p_frame.plane_stride[0];
     const int64_t offset = p_frame.plane_offset[0];
-    if (row > std::numeric_limits<int>::max() ||
-        stride < row ||
+    if (stride < row ||
         offset < 0 ||
         p_frame.data_size <= 0 ||
         offset + stride * (h - 1) + row > p_frame.data_size) {
@@ -237,6 +258,97 @@ Ref<Image> VideoStreamPlaybackAVBridge::_frame_to_image(const avb_video_frame &p
     return Image::create_from_data(w, h, false, Image::FORMAT_RGBA8, buf);
 }
 
+bool VideoStreamPlaybackAVBridge::_copy_nv12_frame(const avb_video_frame &p_frame) {
+    const int w = p_frame.width;
+    const int h = p_frame.height;
+    if (p_frame.memory_type != AVB_VIDEO_MEMORY_CPU ||
+        p_frame.external_type != AVB_VIDEO_EXTERNAL_NONE ||
+        p_frame.format != AVB_PIXEL_FORMAT_NV12 ||
+        p_frame.plane_count < 2 ||
+        w <= 0 || h <= 0 || (w & 1) != 0 || (h & 1) != 0 ||
+        !p_frame.plane_data[0] || !p_frame.plane_data[1] ||
+        p_frame.plane_stride[0] < w || p_frame.plane_stride[1] < w) {
+        return false;
+    }
+
+    _next_y.resize(w * h);
+    _next_uv.resize(w * h / 2);
+    uint8_t *y_dst = _next_y.ptrw();
+    uint8_t *uv_dst = _next_uv.ptrw();
+    for (int y = 0; y < h; ++y) {
+        memcpy(y_dst + (size_t)y * w,
+               p_frame.plane_data[0] + (size_t)y * p_frame.plane_stride[0],
+               (size_t)w);
+    }
+    for (int y = 0; y < h / 2; ++y) {
+        memcpy(uv_dst + (size_t)y * w,
+               p_frame.plane_data[1] + (size_t)y * p_frame.plane_stride[1],
+               (size_t)w);
+    }
+    _next_width = w;
+    _next_height = h;
+    return true;
+}
+
+Ref<Image> VideoStreamPlaybackAVBridge::_nv12_to_image(
+    const PackedByteArray &p_y, const PackedByteArray &p_uv,
+    int p_width, int p_height, avb_color_range p_range,
+    avb_color_matrix p_matrix) const {
+    if (p_y.size() != p_width * p_height ||
+        p_uv.size() != p_width * p_height / 2) {
+        return {};
+    }
+
+    PackedByteArray rgba;
+    rgba.resize(p_width * p_height * 4);
+    uint8_t *dst = rgba.ptrw();
+    const uint8_t *y_plane = p_y.ptr();
+    const uint8_t *uv_plane = p_uv.ptr();
+    for (int y = 0; y < p_height; ++y) {
+        for (int x = 0; x < p_width; ++x) {
+            const float yy =
+                (float)y_plane[(size_t)y * p_width + x] / 255.0f;
+            int uv_offset = (y / 2) * p_width + (x & ~1);
+            float uu = (float)uv_plane[uv_offset] / 255.0f - 0.5f;
+            float vv = (float)uv_plane[uv_offset + 1] / 255.0f - 0.5f;
+            const bool full_range = p_range == AVB_COLOR_RANGE_FULL;
+            const float luma =
+                full_range ? yy : 1.16438356f * (yy - 16.0f / 255.0f);
+            if (!full_range) {
+                uu *= 1.13839286f;
+                vv *= 1.13839286f;
+            }
+
+            float r;
+            float g;
+            float b;
+            if (p_matrix == AVB_COLOR_MATRIX_BT601) {
+                r = luma + 1.402f * vv;
+                g = luma - 0.344136f * uu - 0.714136f * vv;
+                b = luma + 1.772f * uu;
+            } else if (p_matrix == AVB_COLOR_MATRIX_BT2020_NCL) {
+                r = luma + 1.4746f * vv;
+                g = luma - 0.164553f * uu - 0.571353f * vv;
+                b = luma + 1.8814f * uu;
+            } else {
+                r = luma + 1.5748f * vv;
+                g = luma - 0.187324f * uu - 0.468124f * vv;
+                b = luma + 1.8556f * uu;
+            }
+            size_t out = ((size_t)y * p_width + x) * 4;
+            dst[out + 0] =
+                (uint8_t)CLAMP((int)(r * 255.0f + 0.5f), 0, 255);
+            dst[out + 1] =
+                (uint8_t)CLAMP((int)(g * 255.0f + 0.5f), 0, 255);
+            dst[out + 2] =
+                (uint8_t)CLAMP((int)(b * 255.0f + 0.5f), 0, 255);
+            dst[out + 3] = 255;
+        }
+    }
+    return Image::create_from_data(p_width, p_height, false,
+                                   Image::FORMAT_RGBA8, rgba);
+}
+
 void VideoStreamPlaybackAVBridge::_present_frame(const Ref<Image> &p_image) {
     if (p_image.is_null()) {
         return;
@@ -247,6 +359,29 @@ void VideoStreamPlaybackAVBridge::_present_frame(const Ref<Image> &p_image) {
     } else {
         _texture->update(p_image);
     }
+}
+
+void VideoStreamPlaybackAVBridge::_present_next_frame() {
+    if (_next_is_nv12) {
+        if (_use_nv12_gpu &&
+            _nv12_converter->convert(_next_y, _next_uv,
+                                     _next_width, _next_height,
+                                     _next_color_range,
+                                     _next_color_matrix)) {
+            return;
+        }
+        if (_use_nv12_gpu) {
+            UtilityFunctions::printerr(
+                "[avbridge] NV12 GPU conversion failed; using CPU conversion");
+            _use_nv12_gpu = false;
+        }
+        _present_frame(_nv12_to_image(_next_y, _next_uv,
+                                      _next_width, _next_height,
+                                      _next_color_range,
+                                      _next_color_matrix));
+        return;
+    }
+    _present_frame(_next_image);
 }
 
 void VideoStreamPlaybackAVBridge::_decode_next_frame() {
@@ -267,12 +402,33 @@ void VideoStreamPlaybackAVBridge::_decode_next_frame() {
         return;
     }
 
-    _next_image = _frame_to_image(frame);
-    _next_pts   = frame.pts_sec;
-    _have_next  = _next_image.is_valid();
+    _next_image = Ref<Image>();
+    _next_y.clear();
+    _next_uv.clear();
+    _next_width = 0;
+    _next_height = 0;
+    _next_is_nv12 = frame.format == AVB_PIXEL_FORMAT_NV12;
+    _next_color_range = frame.color_range;
+    _next_color_matrix = frame.color_matrix;
+    if (_next_color_range == AVB_COLOR_RANGE_UNKNOWN) {
+        _next_color_range = AVB_COLOR_RANGE_LIMITED;
+    }
+    if (_next_color_matrix == AVB_COLOR_MATRIX_UNKNOWN) {
+        _next_color_matrix =
+            frame.width >= 1280 || frame.height > 576
+                ? AVB_COLOR_MATRIX_BT709
+                : AVB_COLOR_MATRIX_BT601;
+    }
+    _next_pts = frame.pts_sec;
+    if (_next_is_nv12) {
+        _have_next = _copy_nv12_frame(frame);
+    } else {
+        _next_image = _frame_to_image(frame);
+        _have_next = _next_image.is_valid();
+    }
     if (!_have_next) {
         UtilityFunctions::printerr(
-            "[avbridge] decoded frame is not CPU-backed RGBA8 or has an invalid plane layout");
+            "[avbridge] decoded frame has an invalid CPU plane layout");
     }
 
     avb_decoder_release_video_frame(_decoder, &frame);
@@ -338,7 +494,7 @@ void VideoStreamPlaybackAVBridge::_seek(double p_time) {
     // Show the seeked frame right away so scrubbing updates the image even
     // while paused (when _update() does nothing).
     if (_have_next) {
-        _present_frame(_next_image);
+        _present_next_frame();
     }
 }
 
@@ -375,7 +531,7 @@ void VideoStreamPlaybackAVBridge::_update(double p_delta) {
     _mix_audio(_time);
 
     while (_have_next && _next_pts <= _time) {
-        _present_frame(_next_image);
+        _present_next_frame();
         _decode_next_frame();
     }
 
@@ -396,5 +552,11 @@ int VideoStreamPlaybackAVBridge::_get_mix_rate() const {
 }
 
 Ref<Texture2D> VideoStreamPlaybackAVBridge::_get_texture() const {
+    if (_use_nv12_gpu && _nv12_converter) {
+        Ref<Texture2D> texture = _nv12_converter->get_texture();
+        if (texture.is_valid()) {
+            return texture;
+        }
+    }
     return _texture;
 }

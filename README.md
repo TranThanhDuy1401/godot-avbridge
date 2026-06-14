@@ -21,8 +21,14 @@ $VideoStreamPlayer.stream = stream
 $VideoStreamPlayer.play()
 ```
 
-`VideoStreamAVBridge` requests CPU-backed `RGBA8` frames from libavbridge and
-feeds decoded audio to the `VideoStreamPlayer` automatically.
+With a RenderingDevice renderer, `VideoStreamAVBridge` requests NV12 frames,
+uploads separate Y and UV textures, and converts them to RGBA with a compute
+shader. Hardware decoding is preferred when the selected libavbridge backend
+supports it. The current path still reads NV12 back to CPU memory before the
+Godot texture upload; platform-native zero-copy import is planned separately.
+
+Renderers without RenderingDevice support fall back to CPU-backed `RGBA8`.
+Decoded audio is fed to the `VideoStreamPlayer` automatically.
 
 ## Build
 
