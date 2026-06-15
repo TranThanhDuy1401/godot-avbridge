@@ -24,9 +24,7 @@ endif()
 # godot-cpp
 add_subdirectory("${PROJECT_SOURCE_DIR}/lib/godot-cpp")
 
-# libavbridge — built as a static library and linked directly into the
-# extension, so a single shared object ships in the addon. The gstreamer/ffmpeg
-# backends are still loaded at runtime via dlopen (not linked here).
+# libavbridge
 set(AVB_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
 set(AVB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(AVB_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
