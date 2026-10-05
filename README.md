@@ -27,7 +27,7 @@ Decoded audio is fed to the `VideoStreamPlayer` automatically.
 ## Build
 
 ```
-git clone --recursive https://github.com/buresu/godot-avbridge.git
+git clone --recursive https://github.com/TranThanhDuy1401/godot-avbridge
 cd godot-avbridge
 mkdir build && cd build
 
