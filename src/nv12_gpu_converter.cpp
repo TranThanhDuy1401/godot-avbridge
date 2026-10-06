@@ -225,11 +225,11 @@ bool NV12GPUConverter::convert(const PackedByteArray &p_y, const PackedByteArray
     struct {
         int32_t matrix;
         int32_t full_range;
-        int32_t reserved[2];
+
     } params = {
         (int32_t)p_matrix,
         p_range == AVB_COLOR_RANGE_FULL ? 1 : 0,
-        { 0, 0 },
+
     };
     PackedByteArray push_constant;
     push_constant.resize(sizeof(params));
