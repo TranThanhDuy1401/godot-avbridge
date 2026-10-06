@@ -38,6 +38,9 @@ cmake --build . --target install
 # Windows
 cmake -G "Visual Studio 18 2026" ..
 cmake --build . --config [Debug|Release] --target install
+
+If you encounters error when compiling Release-Windows: use this instead:
+cmake -G "Visual Studio 18 2026" .. -A x64 -DCMAKE_BUILD_TYPE=Release
 ```
 
 The build links libavbridge statically into a single shared object. The
