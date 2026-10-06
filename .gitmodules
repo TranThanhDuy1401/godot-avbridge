@@ -4,4 +4,4 @@
 	branch = 4.3
 [submodule "lib/libavbridge"]
 	path = lib/libavbridge
-	url = https://github.com/buresu/libavbridge.git
+	url = https://github.com/TranThanhDuy1401/libavbridge.git
