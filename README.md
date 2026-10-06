@@ -55,7 +55,7 @@ GStreamer 1.x with the `base` and `good` plugin sets.
 Additional plugins are supported only if they and their dependencies are LGPL-compatible. GPL-licensed and non-free GStreamer plugins are not supported.  
 
 ## Windows Notice:
-Vorbis audio codec tested, it's not working. If you encounter the same issue, it is recommended to change the audio codec to Opus.
+Vorbis audio codec tested, it doesn't work. If you encounter the same issue, it is recommended to change the audio codec to Opus.
 
 ## License
 
